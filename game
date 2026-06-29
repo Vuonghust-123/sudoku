@@ -1,0 +1,507 @@
+#include <SFML/Graphics.hpp>
+#include <iostream>
+#include <vector>
+#include <array>
+#include <string>
+#include <chrono>
+#include <algorithm>
+#include <random>
+#include <iomanip>
+#include <sstream>
+
+const int CELL_SIZE = 60;     
+const int GRID_OFFSET = 40;   
+const int BOARD_SIZE = CELL_SIZE * 9;
+const int WINDOW_WIDTH = BOARD_SIZE + GRID_OFFSET * 2;       // 620
+const int WINDOW_HEIGHT = BOARD_SIZE + GRID_OFFSET * 2 + 160; // 780
+
+enum class GameMode { 
+    MAIN_MENU, 
+    CHALLENGE_SELECT, 
+    PLAYING_PRACTICE, 
+    PLAYING_CHALLENGE, 
+    GAME_OVER, 
+    VICTORY, 
+    HISTORY_MENU 
+};
+
+struct HistoryEntry {
+    std::string modeName;
+    int duration;
+    int wrongMoves;
+    bool isWin;
+    int level; 
+};
+
+// ═══════════════════════════════════════════
+//  Class SudokuGenerator (Thuật toán lõi)
+// ═══════════════════════════════════════════
+class SudokuGenerator {
+    std::mt19937 rng;
+    using Grid = std::array<std::array<int,9>,9>;
+
+    bool valid(const Grid& b, int r, int c, int n) const {
+        for (int i=0; i<9; i++) { if(b[r][i]==n || b[i][c]==n) return false; }
+        int br=r/3*3, bc=c/3*3;
+        for (int i=0; i<3; i++) for(int j=0; j<3; j++) if(b[br+i][bc+j]==n) return false;
+        return true;
+    }
+
+    bool fillRandom(Grid& b) {
+        for (int r=0; r<9; r++) for(int c=0; c<9; c++) if(b[r][c]==0) {
+            std::vector<int> ns={1,2,3,4,5,6,7,8,9};
+            std::shuffle(ns.begin(), ns.end(), rng);
+            for (int n:ns) { if(valid(b,r,c,n)){ b[r][c]=n; if(fillRandom(b)) return true; b[r][c]=0; } }
+            return false;
+        }
+        return true;
+    }
+
+    void countSol(Grid b, int& cnt) {
+        if (cnt >= 2) return;
+        for (int r=0; r<9; r++) for(int c=0; c<9; c++) if(b[r][c]==0) {
+            for (int n=1; n<=9; n++) if(valid(b,r,c,n)) { b[r][c]=n; countSol(b,cnt); if(cnt>=2) return; }
+            return;
+        }
+        cnt++;
+    }
+
+public:
+    SudokuGenerator() : rng(std::chrono::steady_clock::now().time_since_epoch().count()) {}
+
+    Grid generateFull() {
+        Grid b{}; for(auto& r:b) r.fill(0);
+        fillRandom(b); return b;
+    }
+
+    Grid generateMaxPuzzle(const Grid& full) {
+        Grid p = full;
+        std::vector<std::pair<int,int>> cells;
+        for(int r=0; r<9; r++) for(int c=0; c<9; c++) cells.push_back({r,c});
+        std::shuffle(cells.begin(), cells.end(), rng);
+
+        for (auto& [r,c]: cells) {
+            int bak = p[r][c]; p[r][c] = 0;
+            int cnt = 0; countSol(p, cnt);
+            if (cnt != 1) p[r][c] = bak; 
+        }
+        return p;
+    }
+};
+
+// ═══════════════════════════════════════════
+//  Class SudokuBoard (Quản lý trạng thái)
+// ═══════════════════════════════════════════
+class SudokuBoard {
+public:
+    using Grid = std::array<std::array<int,9>,9>;
+    Grid puzzle, solution, player;
+    std::array<std::array<bool,9>,9> err;
+
+    SudokuBoard() { reset(); }
+
+    void reset() {
+        for(auto& r:puzzle)   r.fill(0);
+        for(auto& r:solution) r.fill(0);
+        for(auto& r:player)   r.fill(0);
+        for(auto& r:err)      r.fill(false);
+    }
+
+    bool isFixed(int r, int c) const { return puzzle[r][c] != 0; }
+    int  get(int r, int c)     const { return isFixed(r,c) ? puzzle[r][c] : player[r][c]; }
+
+    bool set(int r, int c, int v) {
+        if(isFixed(r,c)) return true;
+        player[r][c] = v;
+        if(v == 0){ err[r][c] = false; return true; }
+        err[r][c] = (v != solution[r][c]);
+        return !err[r][c];
+    }
+
+    bool complete() const {
+        for(int r=0; r<9; r++) for(int c=0; c<9; c++) if(get(r,c) != solution[r][c]) return false;
+        return true;
+    }
+};
+
+std::string formatTime(int totalSeconds) {
+    if (totalSeconds < 0) return "00:00";
+    int mins = totalSeconds / 60;
+    int secs = totalSeconds % 60;
+    std::ostringstream ss;
+    ss << std::setfill('0') << std::setw(2) << mins << ":" << std::setw(2) << secs;
+    return ss.str();
+}
+
+int main() {
+    sf::RenderWindow window(sf::VideoMode(WINDOW_WIDTH, WINDOW_HEIGHT), "Sudoku Lite - HUST Project");
+    window.setFramerateLimit(60);
+
+    sf::Font font;
+    if (!font.loadFromFile("arial.ttf")) {
+        std::cout << "Loi font chu arial.ttf!\n";
+        return -1;
+    }
+
+    SudokuGenerator generator;
+    SudokuBoard board;
+    GameMode mode = GameMode::MAIN_MENU;
+    std::vector<HistoryEntry> history;
+
+    int selectedRow = -1, selectedCol = -1;
+    int wrongMoves = 0;
+    int challengeLevel = 1; 
+    
+    int maxTimeByLvl[]  = {2400, 2040, 1680, 1320, 960, 600, 420, 240}; 
+    int maxWrongByLvl[] = {  30,   20,   15,   10,   5,   3,   1,   0}; 
+
+    sf::Clock gameClock;
+    int elapsedSeconds = 0;
+    int countdownSeconds = 0;
+    bool isGameOverReasonTime = false;
+
+    // UI Buttons Menu chính
+    sf::RectangleShape btnPractice(sf::Vector2f(260, 50)), btnChallengeMenu(sf::Vector2f(260, 50)), btnHistory(sf::Vector2f(260, 50));
+    btnPractice.setPosition(WINDOW_WIDTH/2 - 130, 240);       btnPractice.setFillColor(sf::Color(52, 152, 219));
+    btnChallengeMenu.setPosition(WINDOW_WIDTH/2 - 130, 310);  btnChallengeMenu.setFillColor(sf::Color(230, 126, 34));
+    btnHistory.setPosition(WINDOW_WIDTH/2 - 130, 380);        btnHistory.setFillColor(sf::Color(149, 165, 166));
+
+    // UI Khởi tạo 8 nút chọn Cấp độ (Màn hình CHALLENGE_SELECT)
+    std::vector<sf::RectangleShape> btnLevels(8);
+    for (int i = 0; i < 8; i++) {
+        btnLevels[i].setSize(sf::Vector2f(130, 50));
+        btnLevels[i].setFillColor(sf::Color(46, 204, 113));
+        int row = i / 2;
+        int col = i % 2;
+        float x = (col == 0) ? (WINDOW_WIDTH / 2 - 145) : (WINDOW_WIDTH / 2 + 15);
+        float y = 200 + row * 70;
+        btnLevels[i].setPosition(x, y);
+    }
+
+    // Nút "Quay lại" dùng chung cho các menu phụ
+    sf::RectangleShape btnBackCommon(sf::Vector2f(150, 40));
+    btnBackCommon.setPosition(WINDOW_WIDTH / 2 - 75, 530);
+    btnBackCommon.setFillColor(sf::Color(127, 140, 141));
+
+    // Nút "Quay lại Menu" dùng trong trận
+    sf::RectangleShape btnBackInGame(sf::Vector2f(150, 35));
+    btnBackInGame.setPosition(WINDOW_WIDTH - 170, BOARD_SIZE + GRID_OFFSET + 20);
+    btnBackInGame.setFillColor(sf::Color(127, 140, 141));
+
+    // ═══════════════════════════════════════════
+    //  VÒNG LẶP XỬ LÝ SỰ KIỆN (GAME LOOP)
+    // ═══════════════════════════════════════════
+    while (window.isOpen()) {
+        sf::Event event;
+        while (window.pollEvent(event)) {
+            if (event.type == sf::Event::Closed) window.close();
+
+            sf::Vector2i mousePos = sf::Mouse::getPosition(window);
+            sf::Vector2f mouseCoords = window.mapPixelToCoords(mousePos);
+
+            // 1. MAIN MENU
+            if (mode == GameMode::MAIN_MENU) {
+                if (event.type == sf::Event::MouseButtonPressed && event.mouseButton.button == sf::Mouse::Left) {
+                    if (btnPractice.getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) {
+                        auto full = generator.generateFull();
+                        auto puzzle = generator.generateMaxPuzzle(full);
+                        board.reset(); board.puzzle = puzzle; board.solution = full;
+                        selectedRow = selectedCol = -1; wrongMoves = 0;
+                        gameClock.restart(); mode = GameMode::PLAYING_PRACTICE;
+                    }
+                    else if (btnChallengeMenu.getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) {
+                        mode = GameMode::CHALLENGE_SELECT; 
+                    }
+                    else if (btnHistory.getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) {
+                        mode = GameMode::HISTORY_MENU;
+                    }
+                }
+            }
+            // 2. MÀN HÌNH CHỌN LEVEL THỬ THÁCH (CHALLENGE_SELECT)
+            else if (mode == GameMode::CHALLENGE_SELECT) {
+                if (event.type == sf::Event::MouseButtonPressed && event.mouseButton.button == sf::Mouse::Left) {
+                    if (btnBackCommon.getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) {
+                        mode = GameMode::MAIN_MENU;
+                    }
+                    for (int i = 0; i < 8; i++) {
+                        if (btnLevels[i].getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) {
+                            challengeLevel = i + 1; 
+                            
+                            auto full = generator.generateFull();
+                            auto puzzle = generator.generateMaxPuzzle(full);
+                            board.reset(); board.puzzle = puzzle; board.solution = full;
+                            selectedRow = selectedCol = -1; wrongMoves = 0;
+                            isGameOverReasonTime = false;
+                            
+                            gameClock.restart(); 
+                            mode = GameMode::PLAYING_CHALLENGE;
+                            break;
+                        }
+                    }
+                }
+                if (event.type == sf::Event::KeyPressed && event.key.code == sf::Keyboard::Escape) {
+                    mode = GameMode::MAIN_MENU;
+                }
+            }
+            // 3. LỊCH SỬ & XẾP HẠNG
+            else if (mode == GameMode::HISTORY_MENU) {
+                if ((event.type == sf::Event::MouseButtonPressed && btnBackCommon.getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) || 
+                    (event.type == sf::Event::KeyPressed && event.key.code == sf::Keyboard::Escape)) {
+                    mode = GameMode::MAIN_MENU;
+                }
+            }
+            // 4. XỬ LÝ KHI ĐANG CHƠI
+            else if (mode == GameMode::PLAYING_PRACTICE || mode == GameMode::PLAYING_CHALLENGE) {
+                if (event.type == sf::Event::MouseButtonPressed && event.mouseButton.button == sf::Mouse::Left) {
+                    if (btnBackInGame.getGlobalBounds().contains(mouseCoords.x, mouseCoords.y)) {
+                        mode = GameMode::MAIN_MENU;
+                    }
+                    else if (mouseCoords.x >= GRID_OFFSET && mouseCoords.x < GRID_OFFSET + BOARD_SIZE &&
+                             mouseCoords.y >= GRID_OFFSET && mouseCoords.y < GRID_OFFSET + BOARD_SIZE) {
+                        selectedCol = (mouseCoords.x - GRID_OFFSET) / CELL_SIZE;
+                        selectedRow = (mouseCoords.y - GRID_OFFSET) / CELL_SIZE;
+                    }
+                }
+
+                if (event.type == sf::Event::TextEntered && selectedRow != -1 && selectedCol != -1) {
+                    char enteredChar = static_cast<char>(event.text.unicode);
+                    if (enteredChar >= '1' && enteredChar <= '9') {
+                        if (!board.isFixed(selectedRow, selectedCol)) {
+                            if (!board.set(selectedRow, selectedCol, enteredChar - '0')) {
+                                wrongMoves++;
+                                if (mode == GameMode::PLAYING_CHALLENGE && wrongMoves > maxWrongByLvl[challengeLevel - 1]) {
+                                    history.push_back({"Thu Thach", elapsedSeconds, wrongMoves, false, challengeLevel});
+                                    mode = GameMode::GAME_OVER; 
+                                }
+                            }
+                        }
+                    } else if (enteredChar == '0' || enteredChar == 8) {
+                        board.set(selectedRow, selectedCol, 0);
+                    }
+                }
+
+                if (board.complete()) {
+                    if (mode == GameMode::PLAYING_PRACTICE) {
+                        history.push_back({"Luyen Tap", elapsedSeconds, wrongMoves, true, 0});
+                    } else {
+                        history.push_back({"Thu Thach", elapsedSeconds, wrongMoves, true, challengeLevel});
+                    }
+                    mode = GameMode::VICTORY;
+                }
+            }
+            // 5. MÀN HÌNH KẾT THÚC (THẮNG/THUA)
+            else if (mode == GameMode::GAME_OVER || mode == GameMode::VICTORY) {
+                if (event.type == sf::Event::MouseButtonPressed || event.type == sf::Event::KeyPressed) {
+                    mode = GameMode::MAIN_MENU;
+                }
+            }
+        }
+
+        // Cập nhật bộ đếm thời gian
+        if (mode == GameMode::PLAYING_PRACTICE) {
+            elapsedSeconds = gameClock.getElapsedTime().asSeconds();
+        } else if (mode == GameMode::PLAYING_CHALLENGE) {
+            elapsedSeconds = gameClock.getElapsedTime().asSeconds();
+            countdownSeconds = maxTimeByLvl[challengeLevel - 1] - elapsedSeconds;
+            if (countdownSeconds <= 0) {
+                isGameOverReasonTime = true;
+                history.push_back({"Thu Thach", elapsedSeconds, wrongMoves, false, challengeLevel});
+                mode = GameMode::GAME_OVER;
+            }
+        }
+
+        // ═══════════════════════════════════════════
+        //  XỬ LÝ VẼ GIAO DIỆN (RENDERING)
+        // ═══════════════════════════════════════════
+        window.clear(sf::Color(245, 242, 235));
+
+        // --- SCREEN: MAIN MENU ---
+        if (mode == GameMode::MAIN_MENU) {
+            sf::Text title("SUDOKU LITE - HUST", font, 36);
+            title.setStyle(sf::Text::Bold); title.setFillColor(sf::Color(44, 62, 80));
+            title.setPosition(WINDOW_WIDTH/2 - title.getGlobalBounds().width/2, 120);
+            window.draw(title);
+
+            window.draw(btnPractice); window.draw(btnChallengeMenu); window.draw(btnHistory);
+
+            auto drawMenuTxt = [&](const std::string& s, sf::RectangleShape& b) {
+                sf::Text t(s, font, 18); t.setFillColor(sf::Color::White);
+                t.setPosition(b.getPosition().x + b.getSize().x/2 - t.getGlobalBounds().width/2, b.getPosition().y + 14);
+                window.draw(t);
+            };
+            drawMenuTxt("CHEDO LUYEN TAP", btnPractice);
+            drawMenuTxt("CHEDO THU THACH", btnChallengeMenu);
+            drawMenuTxt("BANG XEP HANG", btnHistory);
+        }
+        // --- SCREEN: CHỌN MỨC ĐỘ THỬ THÁCH (CHALLENGE_SELECT) ---
+        else if (mode == GameMode::CHALLENGE_SELECT) {
+            sf::Text title("CHON CAP DO THU THACH", font, 30);
+            title.setStyle(sf::Text::Bold); title.setFillColor(sf::Color(230, 126, 34));
+            title.setPosition(WINDOW_WIDTH/2 - title.getGlobalBounds().width/2, 100);
+            window.draw(title);
+
+            for (int i = 0; i < 8; i++) {
+                window.draw(btnLevels[i]);
+                sf::Text t("LV " + std::to_string(i + 1), font, 18);
+                t.setFillColor(sf::Color::White); t.setStyle(sf::Text::Bold);
+                t.setPosition(btnLevels[i].getPosition().x + btnLevels[i].getSize().x/2 - t.getGlobalBounds().width/2, btnLevels[i].getPosition().y + 14);
+                window.draw(t);
+            }
+
+            window.draw(btnBackCommon);
+            sf::Text tBack("QUAY LAI", font, 16); tBack.setFillColor(sf::Color::White);
+            tBack.setPosition(btnBackCommon.getPosition().x + btnBackCommon.getSize().x/2 - tBack.getGlobalBounds().width/2, btnBackCommon.getPosition().y + 10);
+            window.draw(tBack);
+        }
+        // --- SCREEN: BẢNG XẾP HẠNG ---
+        else if (mode == GameMode::HISTORY_MENU) {
+            sf::Text title("BANG XEP HANG CHI TIET", font, 28);
+            title.setFillColor(sf::Color(44, 62, 80)); title.setPosition(WINDOW_WIDTH/2 - title.getGlobalBounds().width/2, 40);
+            window.draw(title);
+
+            std::vector<HistoryEntry> practiceRank;
+            std::vector<HistoryEntry> challengeHist;
+            for (auto& h : history) {
+                if (h.modeName == "Luyen Tap" && h.isWin) practiceRank.push_back(h);
+                else if (h.modeName == "Thu Thach") challengeHist.push_back(h);
+            }
+
+            std::sort(practiceRank.begin(), practiceRank.end(), [](const HistoryEntry& a, const HistoryEntry& b){
+                if (a.wrongMoves != b.wrongMoves) return a.wrongMoves < b.wrongMoves;
+                return a.duration < b.duration;
+            });
+
+            sf::Text tHead1("TOP 5 TRAN LUYEN TAP (IT LOI NHAT)", font, 16); tHead1.setFillColor(sf::Color(52, 152, 219)); tHead1.setPosition(40, 110); window.draw(tHead1);
+            for(size_t i=0; i<5 && i<practiceRank.size(); i++) {
+                std::string row = "Top " + std::to_string(i+1) + " -> Loi: " + std::to_string(practiceRank[i].wrongMoves) + " | Thoi gian: " + formatTime(practiceRank[i].duration);
+                sf::Text tRow(row, font, 14); tRow.setFillColor(sf::Color::Black); tRow.setPosition(40, 140 + i*25); window.draw(tRow);
+            }
+
+            sf::Text tHead2("CAC TRAN THU THACH GAN NHAT", font, 16); tHead2.setFillColor(sf::Color(230, 126, 34)); tHead2.setPosition(40, 320); window.draw(tHead2);
+            std::reverse(challengeHist.begin(), challengeHist.end());
+            for(size_t i=0; i<5 && i<challengeHist.size(); i++) {
+                std::string status = challengeHist[i].isWin ? "[THANG]" : "[THUA]";
+                std::string row = "LV " + std::to_string(challengeHist[i].level) + " | " + status + " | Tg: " + formatTime(challengeHist[i].duration) + " | Loi: " + std::to_string(challengeHist[i].wrongMoves);
+                sf::Text tRow(row, font, 14); 
+                tRow.setFillColor(challengeHist[i].isWin ? sf::Color(46, 204, 113) : sf::Color(231, 76, 60));
+                tRow.setPosition(40, 350 + i*25); window.draw(tRow);
+            }
+
+            window.draw(btnBackCommon);
+            sf::Text tBack("QUAY LAI", font, 16); tBack.setFillColor(sf::Color::White);
+            tBack.setPosition(btnBackCommon.getPosition().x + btnBackCommon.getSize().x/2 - tBack.getGlobalBounds().width/2, btnBackCommon.getPosition().y + 10);
+            window.draw(tBack);
+        }
+        // --- SCREEN: TRẬN ĐẤU & CÔNG BỐ ĐÁP ÁN ---
+        else if (mode == GameMode::PLAYING_PRACTICE || mode == GameMode::PLAYING_CHALLENGE || mode == GameMode::GAME_OVER) {
+            
+            // Vẽ ô chọn Highlight màu xanh lam (Chỉ hiển thị khi đang chơi)
+            if (mode != GameMode::GAME_OVER && selectedRow != -1 && selectedCol != -1) {
+                sf::RectangleShape hl(sf::Vector2f(CELL_SIZE, CELL_SIZE));
+                hl.setPosition(GRID_OFFSET + selectedCol * CELL_SIZE, GRID_OFFSET + selectedRow * CELL_SIZE);
+                hl.setFillColor(sf::Color(52, 152, 219, 60)); window.draw(hl);
+            }
+
+            // [FIXED] Vẽ các đường kẻ lưới trước để số đè lên trên (tránh nét vẽ đè gạch ngang mặt chữ số)
+            for (int i = 0; i <= 9; i++) {
+                sf::RectangleShape vLine, hLine;
+                if (i % 3 == 0) {
+                    // Độ dày 4px cho viền 3x3
+                    vLine.setSize(sf::Vector2f(4, BOARD_SIZE)); 
+                    hLine.setSize(sf::Vector2f(BOARD_SIZE, 4));
+                    vLine.setFillColor(sf::Color(44, 62, 80));
+                    hLine.setFillColor(sf::Color(44, 62, 80));
+                    // Căn chỉnh vị trí không dịch chuyển làm lệch ô
+                    vLine.setPosition(GRID_OFFSET + i * CELL_SIZE - 2, GRID_OFFSET);
+                    hLine.setPosition(GRID_OFFSET, GRID_OFFSET + i * CELL_SIZE - 2);
+                } else {
+                    // Độ dày 1px cho viền 1x1 thông thường
+                    vLine.setSize(sf::Vector2f(1, BOARD_SIZE)); 
+                    hLine.setSize(sf::Vector2f(BOARD_SIZE, 1));
+                    vLine.setFillColor(sf::Color(189, 195, 199));
+                    hLine.setFillColor(sf::Color(189, 195, 199));
+                    vLine.setPosition(GRID_OFFSET + i * CELL_SIZE, GRID_OFFSET);
+                    hLine.setPosition(GRID_OFFSET, GRID_OFFSET + i * CELL_SIZE);
+                }
+                window.draw(vLine); window.draw(hLine);
+            }
+
+            // Vòng lặp vẽ số trên lưới ô vuông 
+            for (int r = 0; r < 9; r++) {
+                for (int c = 0; c < 9; c++) {
+                    int val = (mode == GameMode::GAME_OVER) ? board.solution[r][c] : board.get(r, c);
+                    
+                    if (val != 0) {
+                        sf::Text text(std::to_string(val), font, 30);
+                        
+                        if (mode == GameMode::GAME_OVER) {
+                            if (board.isFixed(r, c)) {
+                                text.setFillColor(sf::Color(44, 62, 80)); 
+                            } else {
+                                text.setFillColor(sf::Color(230, 126, 34)); 
+                            }
+                        } else {
+                            if (board.isFixed(r, c)) text.setFillColor(sf::Color(44, 62, 80));
+                            else if (board.err[r][c]) text.setFillColor(sf::Color(231, 76, 60));
+                            else text.setFillColor(sf::Color(41, 128, 185));
+                        }
+
+                        // [FIXED] Chuẩn hóa việc lấy tâm chữ số (Origin) tránh bị lệch text khi đổi số
+                        sf::FloatRect textRect = text.getLocalBounds();
+                        text.setOrigin(textRect.left + textRect.width / 2.0f, textRect.top + textRect.height / 2.0f);
+                        text.setPosition(GRID_OFFSET + c * CELL_SIZE + CELL_SIZE / 2.0f, GRID_OFFSET + r * CELL_SIZE + CELL_SIZE / 2.0f);
+                        window.draw(text);
+                    }
+                }
+            }
+
+            // Khu vực render thông số hiển thị dưới bàn cờ
+            std::string statsStr = "";
+            if (mode == GameMode::PLAYING_PRACTICE) {
+                statsStr = "LUYEN TAP | T.gian: " + formatTime(elapsedSeconds) + " | So loi: " + std::to_string(wrongMoves);
+                sf::Text txtStats(statsStr, font, 18); txtStats.setFillColor(sf::Color(44, 62, 80));
+                txtStats.setPosition(GRID_OFFSET, BOARD_SIZE + GRID_OFFSET + 20); window.draw(txtStats);
+                
+                window.draw(btnBackInGame);
+                sf::Text txtBackInGame("<< MENU", font, 14); txtBackInGame.setFillColor(sf::Color::White);
+                txtBackInGame.setPosition(btnBackInGame.getPosition().x + 40, btnBackInGame.getPosition().y + 8);
+                window.draw(txtBackInGame);
+            } 
+            else if (mode == GameMode::PLAYING_CHALLENGE) {
+                int maxW = maxWrongByLvl[challengeLevel - 1];
+                statsStr = "THU THACH LV " + std::to_string(challengeLevel) + " | Con lai: " + formatTime(countdownSeconds) + " | Loi: " + std::to_string(wrongMoves) + "/" + std::to_string(maxW);
+                sf::Text txtStats(statsStr, font, 18); txtStats.setFillColor(sf::Color(44, 62, 80));
+                txtStats.setPosition(GRID_OFFSET, BOARD_SIZE + GRID_OFFSET + 20); window.draw(txtStats);
+                
+                window.draw(btnBackInGame);
+                sf::Text txtBackInGame("<< MENU", font, 14); txtBackInGame.setFillColor(sf::Color::White);
+                txtBackInGame.setPosition(btnBackInGame.getPosition().x + 40, btnBackInGame.getPosition().y + 8);
+                window.draw(txtBackInGame);
+            }
+            else if (mode == GameMode::GAME_OVER) {
+                std::string reason = isGameOverReasonTime ? "HET THOI GIAN QUY DINH!" : "QUA SO LUOT LOI CHO PHEP!";
+                statsStr = "GAME OVER - " + reason;
+                sf::Text txtStats(statsStr, font, 16); txtStats.setFillColor(sf::Color(231, 76, 60)); txtStats.setStyle(sf::Text::Bold);
+                txtStats.setPosition(GRID_OFFSET, BOARD_SIZE + GRID_OFFSET + 15); window.draw(txtStats);
+
+                sf::Text txtHint("Mau Cam la Dap an dung. Bam nut bat ky de ve Menu", font, 14);
+                txtHint.setFillColor(sf::Color(127, 140, 141));
+                txtHint.setPosition(GRID_OFFSET, BOARD_SIZE + GRID_OFFSET + 45); window.draw(txtHint);
+            }
+        }
+        // --- SCREEN: VICTORY ---
+        else if (mode == GameMode::VICTORY) {
+            sf::Text t1("CHIEN THANG!", font, 36); t1.setFillColor(sf::Color(46, 204, 113)); t1.setStyle(sf::Text::Bold);
+            t1.setPosition(WINDOW_WIDTH/2 - t1.getGlobalBounds().width/2, 200); window.draw(t1);
+
+            sf::Text t2("Thoi gian: " + formatTime(elapsedSeconds) + " | Tong loi sai: " + std::to_string(wrongMoves), font, 20);
+            t2.setFillColor(sf::Color(44, 62, 80)); t2.setPosition(WINDOW_WIDTH/2 - t2.getGlobalBounds().width/2, 280); window.draw(t2);
+
+            sf::Text t3("Bam nut bat ky de ve Menu", font, 16); t3.setFillColor(sf::Color(149, 165, 166)); t3.setPosition(WINDOW_WIDTH/2 - t3.getGlobalBounds().width/2, 450); window.draw(t3);
+        }
+
+        window.display();
+    }
+
+    return 0;
+}
